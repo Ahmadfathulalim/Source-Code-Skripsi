@@ -1,0 +1,150 @@
+import socket
+import cv2
+import torch
+from ultralytics import YOLO
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Cek apakah CUDA tersedia dan gunakan GPU
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device digunakan: {device}")
+
+# Load model YOLO
+model = YOLO(r"D:\TA\Yolo 100 Iterasi\model_robot_terlatih.pt")
+
+# Membuka kamera
+cap = cv2.VideoCapture(0)
+
+# Mengatur koneksi socket
+server_ip = '127.0.0.1'  # IP server C#
+server_port = 5005
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect((server_ip, server_port))
+
+# Lists untuk menyimpan data
+detection_data = {
+    'frame_numbers': [],
+    'object_classes': [],
+    'object_coordinates_x': [],
+    'object_coordinates_y': [],
+    'detection_times': []
+}
+
+movement_data = {
+    'frame_numbers': [],
+    'movement_times': []
+}
+
+# Inisialisasi penghitungan waktu
+prev_time = cv2.getTickCount()
+
+# Loop untuk terus membaca frame dari kamera
+frame_index = 0
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        print("Tidak dapat membaca frame dari kamera.")
+        break
+
+    # Mengatur ukuran frame
+    scale_percent = 65
+    width = int(frame.shape[1] * scale_percent / 100)
+    height = int(frame.shape[0] * scale_percent / 100)
+    dim = (width, height)
+    frame = cv2.resize(frame, dim, interpolation=cv2.INTER_AREA)
+
+    # Menggunakan model YOLO untuk melakukan prediksi
+    detection_start_time = cv2.getTickCount()
+    results = model.predict(source=frame, conf=0.5, show=False)
+    detection_end_time = cv2.getTickCount()
+    
+    # Hitung waktu deteksi
+    detection_time = (detection_end_time - detection_start_time) / cv2.getTickFrequency()
+
+    # Menghitung waktu per frame
+    curr_time = cv2.getTickCount()
+    time_diff = (curr_time - prev_time) / cv2.getTickFrequency()
+    prev_time = curr_time
+    
+    # Menggambar bounding box dan menampilkan koordinat
+    for result in results:
+        boxes = result.boxes.xyxy
+        confidences = result.boxes.conf
+        class_ids = result.boxes.cls
+        
+        for box, conf, cls_id in zip(boxes, confidences, class_ids):
+            x1, y1, x2, y2 = map(int, box)
+
+            # Gambar bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Label dengan nama kelas dan confidence score
+            label = f"{model.names[int(cls_id)]}: {conf:.2f}"
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            
+            # Mengubah skala koordinat untuk Unity
+            scaled_x1 = int(x1)
+            scaled_y2 = int(frame.shape[0] - y2)
+
+            koordinat_x1 = max(0, int(scaled_x1 - 300)*7)
+            koordinat_y1 = max(0, int(scaled_y2 - 31)*8)
+
+            # Menampilkan titik koordinat pada frame di bawah kiri bounding box
+            koordinat = f"({koordinat_x1}, {koordinat_y1})"
+            cv2.putText(frame, koordinat, (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            detection_data['frame_numbers'].append(frame_index)
+            detection_data['detection_times'].append(detection_time)
+
+
+            # Menyimpan data deteksi untuk kelas "robot" saja
+            if model.names[int(cls_id)] == "Robot":
+                detection_data['object_classes'].append(model.names[int(cls_id)])
+                detection_data['object_coordinates_x'].append(koordinat_x1)
+                detection_data['object_coordinates_y'].append(koordinat_y1)
+
+            # Mengirim data ke server C#
+            data = f"{model.names[int(cls_id)]},{koordinat_x1},{koordinat_y1}"
+            sock.sendall(data.encode('utf-8'))
+
+    # Tampilkan frame dengan bounding box dan koordinat
+    cv2.imshow("YOLO Detection", frame)
+
+    # Keluar dari loop jika tombol 'q' ditekan
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+    
+    frame_index += 1
+
+cap.release()
+cv2.destroyAllWindows()
+sock.close()
+
+# Plotting grafik
+plt.figure(figsize=(10, 8))
+
+# Subplot 1: Scatter plot untuk koordinat objek
+plt.subplot(2, 1, 1)
+plt.scatter(detection_data['object_coordinates_x'], detection_data['object_coordinates_y'], label='Koordinat Objek', color='blue')
+plt.title('Grafik Koordinat Objek Terdeteksi')
+plt.xlabel('Koordinat X')
+plt.ylabel('Koordinat Y')
+plt.legend()
+plt.grid(True)
+
+# Subplot 2: Waktu deteksi
+plt.subplot(2, 1, 2)
+plt.plot(detection_data['frame_numbers'], detection_data['detection_times'], label='Waktu Deteksi', color='green')
+plt.title('Grafik Waktu Deteksi per Frame')
+plt.xlabel('Frame')
+plt.ylabel('Proses Sistem Visualisasi (detik)')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# Simpan data untuk analisis lebih lanjut
+import json
+with open('detection_data.json', 'w') as f:
+    json.dump(detection_data, f)
