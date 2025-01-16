@@ -1,0 +1,296 @@
+using UnityEngine;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using TMPro;
+using System.Threading.Tasks;
+using System;
+
+public class RobotController : MonoBehaviour
+{
+    [Header("Network Configuration")]
+    [SerializeField] private int port = 5005;
+    [SerializeField] private bool showDebugMessages = true;
+
+    [Header("Movement Settings")]
+    [SerializeField] private float moveSpeed = 0.009f;
+    [SerializeField] private float rotationSpeed = 60f;
+    [SerializeField] private float smoothMovementSpeed = 10f;
+
+    [Header("Boundary Settings")]
+    [SerializeField] private float minX = 0f;
+    [SerializeField] private float maxX = 2.5f;
+    [SerializeField] private float minZ = 0f;
+    [SerializeField] private float maxZ = 2.35f;
+
+    [Header("UI References")]
+    [SerializeField] private TextMeshProUGUI coordinateText;
+    [SerializeField] private TextMeshProUGUI statusText;
+    [SerializeField] private TextMeshProUGUI detectionText;
+
+    // Private variables for networking
+    private TcpListener server;
+    private TcpClient client;
+    private NetworkStream stream;
+    private bool isServerRunning;
+
+    // Movement and position tracking
+    private Vector3 targetPosition;
+    private float receivedX;
+    private float receivedZ;
+    private string lastDetectedClass = "";
+    private float lastDetectionTime;
+
+    // Stopwatch for measuring processing time
+    private System.Diagnostics.Stopwatch stopwatch;
+
+    private void Start()
+    {
+        Application.runInBackground = true;
+        InitializeServer();
+        targetPosition = transform.position;
+        UpdateStatusText("Starting server...");
+        stopwatch = new System.Diagnostics.Stopwatch();
+    }
+
+    private void InitializeServer()
+    {
+        try
+        {
+            server = new TcpListener(IPAddress.Any, port);
+            server.Start();
+            isServerRunning = true;
+            LogMessage($"Server started on port {port}");
+            UpdateStatusText("Server running - Waiting for connection...");
+            AcceptClientsAsync();
+        }
+        catch (Exception e)
+        {
+            LogError($"Server initialization failed: {e.Message}");
+            UpdateStatusText("Server failed to start!");
+        }
+    }
+
+    private async void AcceptClientsAsync()
+    {
+        while (isServerRunning)
+        {
+            try
+            {
+                client = await server.AcceptTcpClientAsync();
+                stream = client.GetStream();
+                LogMessage($"Client connected from: {client.Client.RemoteEndPoint}");
+                UpdateStatusText("Client connected!");
+            }
+            catch (Exception e)
+            {
+                if (isServerRunning)
+                {
+                    LogError($"Client acceptance error: {e.Message}");
+                    UpdateStatusText("Connection error!");
+                    await Task.Delay(1000); // Wait before trying again
+                }
+            }
+        }
+    }
+
+    private void Update()
+    {
+        HandleNetworkData();
+        UpdateMovement();
+        UpdateUI();
+    }
+
+    private void HandleNetworkData()
+    {
+        if (client != null && client.Connected && stream != null && stream.DataAvailable)
+        {
+            try
+            {
+                byte[] buffer = new byte[1024];
+                int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                if (bytesRead > 0)
+                {
+                    string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    stopwatch.Restart(); // Mulai stopwatch untuk mengukur waktu proses
+                    ProcessReceivedData(data);
+                }
+            }
+            catch (Exception e)
+            {
+                LogError($"Data reading error: {e.Message}");
+                DisconnectClient();
+            }
+        }
+    }
+
+    private void ProcessReceivedData(string data)
+    {
+        try
+        {
+            string[] parts = data.Split(',');
+            if (parts.Length == 3)
+            {
+                string className = parts[0].Trim().ToLower();
+                if (float.TryParse(parts[1], out float x) && float.TryParse(parts[2], out float y))
+                {
+                    lastDetectedClass = className;
+                    lastDetectionTime = Time.time;
+
+                    switch (className)
+                    {
+                        case "robot":
+                            UpdateTargetPosition(x, y);
+                            break;
+                        case "putar-kiri":
+                            RotateRobot(-1);
+                            break;
+                        case "putar-kanan":
+                            RotateRobot(1);
+                            break;
+                    }
+
+                    stopwatch.Stop(); // Hentikan stopwatch setelah proses selesai
+                    SendProcessingTime();
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            LogError($"Data processing error: {e.Message}");
+        }
+    }
+
+    private void UpdateTargetPosition(float x, float y)
+    {
+        receivedX = x * moveSpeed;
+        receivedZ = y * moveSpeed;
+
+        Vector3 newPosition = transform.position;
+        newPosition.x = Mathf.Clamp(receivedX, minX, maxX);
+        newPosition.z = Mathf.Clamp(receivedZ, minZ, maxZ);
+        targetPosition = newPosition;
+    }
+
+    private void RotateRobot(float direction)
+    {
+        transform.Rotate(Vector3.up * direction * rotationSpeed * Time.deltaTime);
+    }
+
+    private void UpdateMovement()
+    {
+        if (Vector3.Distance(transform.position, targetPosition) > 0.001f)
+        {
+            transform.position = Vector3.Lerp(transform.position, targetPosition, Time.deltaTime * smoothMovementSpeed);
+        }
+    }
+
+    private void UpdateUI()
+    {
+        if (coordinateText != null)
+        {
+            coordinateText.text = $"Position: X={transform.position.x:F2}, Y={transform.position.z:F2}";
+        }
+
+        if (detectionText != null && Time.time - lastDetectionTime < 1f)
+        {
+            detectionText.text = $"Detected: {lastDetectedClass}";
+        }
+        else if (detectionText != null)
+        {
+            detectionText.text = "No recent detection";
+        }
+    }
+
+    private void UpdateStatusText(string message)
+    {
+        if (statusText != null)
+        {
+            statusText.text = $"Status: {message}";
+        }
+    }
+
+    private void SendProcessingTime()
+    {
+        try
+        {
+            double processingTime = stopwatch.Elapsed.TotalMilliseconds;
+            string response = processingTime.ToString("F2");
+            byte[] responseData = Encoding.UTF8.GetBytes(response);
+            stream.Write(responseData, 0, responseData.Length);
+            LogMessage($"Processing time sent: {response} ms");
+        }
+        catch (Exception e)
+        {
+            LogError($"Error sending processing time: {e.Message}");
+        }
+    }
+
+    private void SendCoordinates()
+    {
+        if (client != null && client.Connected && stream != null)
+        {
+            try
+            {
+                // Ambil posisi saat ini
+                float x = transform.position.x;
+                float y = transform.position.z; // Gunakan Z untuk koordinat Y pada bidang 2D
+
+                // Format data koordinat
+                string coordinates = $"X={x:F2},Y={y:F2}";
+
+                // Konversi ke byte array
+                byte[] data = Encoding.UTF8.GetBytes(coordinates);
+
+                // Kirim data ke Python
+                stream.Write(data, 0, data.Length);
+
+                // Debugging
+                Debug.Log($"Koordinat terkirim: {coordinates}");
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"Kesalahan saat mengirim koordinat: {e.Message}");
+            }
+        }
+    }
+
+
+    private void LogMessage(string message)
+    {
+        if (showDebugMessages)
+        {
+            Debug.Log($"[RobotController] {message}");
+        }
+    }
+
+    private void LogError(string message)
+    {
+        Debug.LogError($"[RobotController] {message}");
+    }
+
+    private void DisconnectClient()
+    {
+        if (client != null)
+        {
+            client.Close();
+            client = null;
+        }
+        if (stream != null)
+        {
+            stream.Close();
+            stream = null;
+        }
+        UpdateStatusText("Client disconnected");
+    }
+
+    private void OnDisable()
+    {
+        isServerRunning = false;
+        DisconnectClient();
+        if (server != null)
+        {
+            server.Stop();
+        }
+    }
+}
